@@ -1,0 +1,623 @@
+# =====================================================================================
+#  Weather-Conditioned Adaptive Stacking (WCAS) for HOURLY Temperature Forecasting
+#  Dataset : NASA POWER hourly data (Combined.csv)  -- NO daily aggregation
+#  Target  : T2M at time t+H (default H = 1 hour ahead), one forecasting horizon
+#  Metrics : MAE, RMSE, R2 for 6 comparators + WCAS (plus bias and hot/moderate/cool RMSE)
+#  Run     : Kaggle notebook (paste into one cell, or split at the "# %%" markers)
+# =====================================================================================
+
+# %% 0. Imports and configuration
+import glob
+import os
+import time
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.optimize import minimize
+
+from sklearn.base import clone, BaseEstimator, RegressorMixin
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVR
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
+
+sns.set_theme(style="whitegrid", context="notebook")
+plt.rcParams.update({"figure.dpi": 100, "axes.titleweight": "bold",
+                     "font.size": 16, "axes.titlesize": 18, "axes.labelsize": 18,
+                     "xtick.labelsize": 16, "ytick.labelsize": 16,
+                     "legend.fontsize": 16, "legend.title_fontsize": 18,
+                     "figure.titlesize": 19})
+
+SEED        = 42
+DATA_PATH   = os.environ.get(
+    "DATA_PATH",
+    "data/Combined.csv")
+if not os.path.exists(DATA_PATH):
+    hits = glob.glob("/kaggle/input/**/Combined.csv", recursive=True)
+    if hits:
+        DATA_PATH = hits[0]
+OUT_DIR     = os.environ.get("OUT_DIR", "results")
+FIG_DIR     = os.environ.get("FIG_DIR", "figures")
+os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(FIG_DIR, exist_ok=True)
+
+H           = 1              # forecast horizon in HOURS (predict T2M at t+H)
+TEST_FRAC   = 0.20           # last 20 % of the timeline = test (chronological)
+N_SPLITS    = 5              # expanding-window folds for out-of-fold (OOF) predictions
+HOT_Q, COOL_Q = 0.90, 0.10   # hot / cool thresholds (quantiles of TRAIN targets)
+P_GRID      = (0, 0.5, 1, 2, 3, 4, 6, 8)   # sharpness of adaptive weights (0 = equal weights)
+SVR_MAX_N   = 10000          # SVR is O(n^2): it is trained on an evenly-spaced subsample of the training rows
+N_JOBS      = -1
+np.random.seed(SEED)
+
+def finish(name):
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, f"{name}.png"), dpi=130, bbox_inches="tight")
+    plt.close()
+
+# %% 1. Load & clean (hourly resolution is kept) 
+if not os.path.isfile(DATA_PATH):
+    raise FileNotFoundError(
+        f"Dataset not found: {DATA_PATH}. Download Combined.csv and set DATA_PATH."
+    )
+raw = pd.read_csv(DATA_PATH)
+required = {"YEAR", "MO", "DY", "HR", "T2M", "QV2M", "RH2M", "PS",
+            "WS10M", "WS50M", "WD10M", "PRECTOTCORR", "ALLSKY_SFC_SW_DWN",
+            "CLRSKY_SFC_SW_DWN", "ALLSKY_SFC_SW_DNI", "ALLSKY_SFC_SW_DIFF",
+            "ALLSKY_KT", "ALLSKY_SFC_UV_INDEX", "ALLSKY_SFC_UVB",
+            "ALLSKY_SFC_UVA", "ALLSKY_SRF_ALB"}
+missing = sorted(required - set(raw.columns))
+if missing:
+    raise ValueError(f"Missing required dataset columns: {missing}")
+raw["datetime"] = pd.to_datetime(dict(year=raw.YEAR, month=raw.MO, day=raw.DY, hour=raw.HR))
+raw = raw.drop(columns=["YEAR", "MO", "DY", "HR"]).set_index("datetime").sort_index()
+raw = raw[~raw.index.duplicated(keep="first")]
+
+full_range = pd.date_range(raw.index.min(), raw.index.max(), freq="h")
+print(f"Raw hourly data : {raw.shape[0]:,} rows x {raw.shape[1]} columns")
+print(f"Period          : {raw.index.min()}  ->  {raw.index.max()}")
+print(f"Missing hours   : {len(full_range) - len(raw)}")
+
+# NASA POWER uses -999 as the "undefined" flag (e.g. clearness index / albedo at night)
+sentinel_counts = (raw == -999).sum()
+sentinel_counts = sentinel_counts[sentinel_counts > 0].sort_values()
+raw = raw.replace(-999, np.nan).reindex(full_range)       # regular hourly grid
+
+# wind vector components (so direction can be used without the 0/360 discontinuity)
+raw["WIND_U"] = raw["WS10M"] * np.sin(np.deg2rad(raw["WD10M"]))
+raw["WIND_V"] = raw["WS10M"] * np.cos(np.deg2rad(raw["WD10M"]))
+
+hourly = pd.DataFrame({
+    "T": raw["T2M"], "QV": raw["QV2M"], "RH": raw["RH2M"], "PS": raw["PS"],
+    "WS10": raw["WS10M"], "WS50": raw["WS50M"], "WIND_U": raw["WIND_U"], "WIND_V": raw["WIND_V"],
+    "PRECIP": raw["PRECTOTCORR"],
+    "SW": raw["ALLSKY_SFC_SW_DWN"], "CLR": raw["CLRSKY_SFC_SW_DWN"],
+    "DNI": raw["ALLSKY_SFC_SW_DNI"], "DIFF": raw["ALLSKY_SFC_SW_DIFF"],
+    "KT": raw["ALLSKY_KT"], "UVI": raw["ALLSKY_SFC_UV_INDEX"],
+    "UVB": raw["ALLSKY_SFC_UVB"], "UVA": raw["ALLSKY_SFC_UVA"], "ALB": raw["ALLSKY_SRF_ALB"],
+})
+# Cloud cover proxy based on solar radiation.
+hourly["CLOUD"] = (1 - hourly["SW"] / hourly["CLR"].where(hourly["CLR"] > 5)).clip(0, 1)
+hourly = hourly.ffill(limit=3)
+hourly["CLOUD"] = hourly["CLOUD"].fillna(0)
+print(f"\nHourly table    : {hourly.shape[0]:,} hours x {hourly.shape[1]} variables")
+
+# %% 2. Feature engineering (features use information up to the END of hour t) 
+base = ["T", "RH", "QV", "PS", "WS10", "PRECIP", "SW", "CLOUD"]
+feats = {c: hourly[c] for c in hourly.columns}
+for L in (1, 2, 3, 6, 12, 24, 48, 168):
+    feats[f"T_lag{L}"] = hourly["T"].shift(L)
+for v in base[1:]:
+    for L in (1, 3, 6, 24):
+        feats[f"{v}_lag{L}"] = hourly[v].shift(L)
+for v in base:
+    for w in (6, 24, 72):
+        feats[f"{v}_rm{w}"] = hourly[v].rolling(w).mean()
+for w in (3, 12, 168):
+    feats[f"T_rm{w}"] = hourly["T"].rolling(w).mean()
+for w in (24, 72):
+    feats[f"T_rs{w}"] = hourly["T"].rolling(w).std()
+feats["T_max24"]  = hourly["T"].rolling(24).max()
+feats["T_min24"]  = hourly["T"].rolling(24).min()
+for d in (1, 3, 24):
+    feats[f"T_diff{d}"] = hourly["T"].diff(d)
+feats["PS_diff3"] = hourly["PS"].diff(3)                    # pressure tendency
+hr  = hourly.index.hour.values
+doy = hourly.index.dayofyear.values
+feats["HR_SIN"]  = np.sin(2 * np.pi * hr / 24);        feats["HR_COS"]  = np.cos(2 * np.pi * hr / 24)
+feats["DOY_SIN"] = np.sin(2 * np.pi * doy / 365.25);   feats["DOY_COS"] = np.cos(2 * np.pi * doy / 365.25)
+F = pd.DataFrame(feats, index=hourly.index)
+
+idx = F.dropna().index
+idx = idx[idx <= hourly.index[-1] - pd.Timedelta(hours=H)]
+split = len(idx) - int(len(idx) * TEST_FRAC)
+test_start = idx[split]
+print(f"Samples: {len(idx):,} | train: {idx[0]} -> {idx[split-1]} ({split:,}) "
+      f"| test: {test_start} -> {idx[-1]} ({len(idx)-split:,})")
+
+T_train = hourly.loc[hourly.index < test_start, "T"]
+HOT_THR, COOL_THR = T_train.quantile(HOT_Q), T_train.quantile(COOL_Q)
+print(f"Hot threshold (>= q{int(HOT_Q*100)} train): {HOT_THR:.2f} C | cool threshold (<= q{int(COOL_Q*100)}): {COOL_THR:.2f} C")
+
+# %% 3. Exploratory data analysis 
+print("\n=== Hourly summary statistics ===")
+print(hourly.describe().T.round(2).to_string())
+
+# 3.1 data quality -----------------------------------------------------------------------
+if len(sentinel_counts):
+    fig, ax = plt.subplots(figsize=(8, 3.2))
+    pct = sentinel_counts / len(raw) * 100
+    pct.plot.barh(ax=ax, color="#d95f02")
+    ax.set_xlabel("% of hourly records flagged -999 (undefined)")
+    ax.set_title("Data quality: NASA POWER 'undefined' flags")
+    for i, v in enumerate(pct):
+        ax.text(v + 0.5, i, f"{v:.1f}%", va="center")
+    finish("01_data_quality")
+
+# 3.2 overview time series ----------------------------------------------------------------
+fig, axes = plt.subplots(4, 1, figsize=(13, 11), sharex=True)
+axes[0].plot(hourly.index, hourly["T"], lw=.3, color="#d73027", alpha=.6, label="T2M (hourly)")
+axes[0].plot(hourly.index, hourly["T"].rolling(24 * 30, center=True).mean(), color="k", lw=1.5, label="30-day mean")
+axes[0].axhline(HOT_THR, ls="--", color="darkred", lw=1, label=f"hot thr. {HOT_THR:.1f}°C")
+axes[0].set_ylabel("T2M (°C)"); axes[0].legend(ncol=3, fontsize=11, loc="lower right")
+axes[1].plot(hourly.index, hourly.RH, lw=.3, color="teal"); axes[1].set_ylabel("RH (%)")
+axes[2].plot(hourly.index, hourly.PRECIP, lw=.3, color="navy"); axes[2].set_ylabel("Precip (mm/h)")
+axes[3].plot(hourly.index, hourly.SW, lw=.3, color="orange"); axes[3].set_ylabel("Solar GHI (W/m²)")
+for a in axes:
+    a.axvline(test_start, color="green", ls=":", lw=2)
+axes[0].text(test_start, axes[0].get_ylim()[1], "  test period →", color="green", va="top", fontweight="bold")
+axes[0].set_title("Hourly series with chronological train/test split")
+finish("02_time_series_overview")
+
+# 3.3 distributions -------------------------------------------------------------------------
+fig, axes = plt.subplots(2, 3, figsize=(14, 7))
+for a, (col, lab, c) in zip(axes.ravel(), [
+        ("T", "T2M (°C)", "#d73027"), ("RH", "RH (%)", "teal"), ("QV", "Specific humidity (g/kg)", "#fc8d59"),
+        ("PRECIP", "Precip (mm/h)", "navy"), ("SW", "Solar GHI (W/m²)", "orange"), ("WS10", "Wind 10 m (m/s)", "gray")]):
+    sns.histplot(hourly[col], kde=True, color=c, ax=a, bins=40)
+    a.set_xlabel(lab); a.set_title(f"skew = {hourly[col].skew():.2f}")
+    if col == "T":
+        a.axvline(HOT_THR, color="darkred", ls="--"); a.axvline(COOL_THR, color="navy", ls="--")
+    if col in ("PRECIP", "SW"):
+        a.set_yscale("log")
+fig.suptitle("Distributions of key hourly variables (dashed = hot/cool thresholds)", y=1.01, fontweight="bold")
+finish("03_distributions")
+
+# 3.4 diurnal & seasonal structure ----------------------------------------------------------
+fig, axes = plt.subplots(1, 3, figsize=(20, 5), gridspec_kw={"width_ratios": [1.1, 1, 1]})
+hm = hourly.groupby([hourly.index.hour, hourly.index.month])["T"].mean().unstack()
+sns.heatmap(hm, cmap="RdYlBu_r", ax=axes[0], cbar_kws={"label": "mean T2M (°C)"})
+axes[0].set_xlabel("Month"); axes[0].set_ylabel("Hour of day"); axes[0].set_title("Diurnal × seasonal temperature")
+for m, c in zip([1, 4, 7, 10], ["#4575b4", "#d73027", "#1a9850", "#f46d43"]):
+    sub = hourly[hourly.index.month == m]
+    s = sub.groupby(sub.index.hour)["T"]
+    axes[1].plot(s.mean().index, s.mean().values, color=c, label=f"Month {m}")
+    axes[1].fill_between(s.mean().index, s.mean() - s.std(), s.mean() + s.std(), color=c, alpha=.12)
+axes[1].set_xlabel("Hour"); axes[1].set_ylabel("T2M (°C)"); axes[1].legend(); axes[1].set_title("Mean diurnal curve (±1 SD)")
+sns.boxplot(x=hourly.index.month, y=hourly["T"], ax=axes[2], palette="coolwarm", fliersize=1)
+axes[2].set_xlabel("Month"); axes[2].set_ylabel("T2M (°C)"); axes[2].set_title("T2M by month")
+finish("04_diurnal_seasonal")
+
+# 3.5 monthly climatology of drivers -----------------------------------------------------------
+fig, axes = plt.subplots(2, 3, figsize=(15, 7))
+for a, (col, lab, c) in zip(axes.ravel(), [
+        ("T", "T2M (°C)", "#d73027"), ("RH", "RH (%)", "teal"), ("PRECIP", "Precip (mm/h)", "navy"),
+        ("SW", "GHI (W/m²)", "orange"), ("CLOUD", "Cloudiness index", "gray"), ("PS", "Pressure (kPa)", "purple")]):
+    s = hourly.groupby(hourly.index.month)[col]
+    a.plot(s.mean().index, s.mean(), "-o", color=c)
+    a.fill_between(s.mean().index, s.mean() - s.std(), s.mean() + s.std(), color=c, alpha=.2)
+    a.set_title(lab); a.set_xlabel("Month"); a.set_xticks(range(1, 13))
+fig.suptitle("Monthly climatology (mean ± 1 SD)", y=1.01, fontweight="bold")
+finish("05_monthly_climatology")
+
+# 3.6 correlations --------------------------------------------------------------------------------
+corr_cols = ["T", "QV", "RH", "PS", "WS10", "WS50", "PRECIP", "SW", "CLR", "DNI", "DIFF", "KT", "CLOUD", "UVI", "UVB", "UVA", "ALB"]
+fig, ax = plt.subplots(figsize=(11, 9))
+sns.heatmap(hourly[corr_cols].corr(), cmap="coolwarm", center=0, annot=True, fmt=".1f",
+            annot_kws={"size": 10}, ax=ax, cbar_kws={"shrink": .7})
+ax.set_title("Pearson correlation of hourly variables")
+finish("06_correlation_heatmap")
+
+nxt = hourly["T"].shift(-H)
+cc = hourly[corr_cols].corrwith(nxt).drop("T", errors="ignore").sort_values()
+fig, ax = plt.subplots(figsize=(7, 6))
+ax.barh(cc.index, cc.values, color=np.where(cc > 0, "#d73027", "#4575b4"))
+ax.set_xlabel(f"Correlation with T2M at t+{H}h"); ax.set_title("Predictive signal of current variables")
+finish("07_corr_with_target")
+
+# 3.7 physical relationships -----------------------------------------------------------------------
+SEASON_MAP = {12: "Winter", 1: "Winter", 2: "Winter", 3: "Pre-monsoon", 4: "Pre-monsoon", 5: "Pre-monsoon",
+              6: "Monsoon", 7: "Monsoon", 8: "Monsoon", 9: "Monsoon", 10: "Post-monsoon", 11: "Post-monsoon"}
+season_order = ["Winter", "Pre-monsoon", "Monsoon", "Post-monsoon"]
+samp = hourly.sample(min(8000, len(hourly)), random_state=SEED)
+season_s = pd.Series(samp.index.month, index=samp.index).map(SEASON_MAP)
+fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+for a, (x, xl) in zip(axes.ravel(), [("RH", "RH (%)"), ("QV", "Specific humidity (g/kg)"),
+                                    ("SW", "Solar GHI (W/m²)"), ("PRECIP", "Precip (mm/h)")]):
+    sns.scatterplot(x=samp[x], y=samp["T"], hue=season_s, hue_order=season_order, s=8, alpha=.5,
+                    ax=a, palette="Set2", linewidth=0)
+    a.set_xlabel(xl); a.set_ylabel("T2M (°C)"); a.legend(fontsize=10)
+    a.set_title(f"Spearman ρ = {stats.spearmanr(hourly[x], hourly['T'])[0]:.2f}")
+fig.suptitle("T2M vs. meteorological drivers (8,000 random hours)", y=1.01, fontweight="bold")
+finish("08_temp_vs_drivers")
+
+# 3.8 temporal dependence ----------------------------------------------------------------------------
+clim_hm = hourly.groupby([hourly.index.month, hourly.index.hour])["T"].transform("mean")
+anom = hourly["T"] - clim_hm
+def acf(x, nlags=168):
+    x = np.asarray(x) - np.mean(x)
+    return np.array([np.corrcoef(x[:-k], x[k:])[0, 1] for k in range(1, nlags + 1)])
+lags = np.arange(1, 169)
+fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
+axes[0].bar(lags, acf(hourly["T"]), color="#d73027", width=1); axes[0].set_title("ACF of T2M (raw)")
+axes[1].bar(lags, acf(anom), color="#4575b4", width=1); axes[1].set_title("ACF of T2M anomaly (diurnal+seasonal removed)")
+for a in axes[:2]:
+    a.axhline(1.96 / np.sqrt(len(hourly)), ls="--", color="k", lw=.8); a.set_xlabel("Lag (hours)")
+sm = hourly.sample(min(6000, len(hourly) - H), random_state=SEED).index
+axes[2].scatter(hourly["T"].loc[sm], hourly["T"].shift(-H).loc[sm], s=4, alpha=.3, color="gray")
+lo_, hi_ = hourly["T"].min(), hourly["T"].max(); axes[2].plot([lo_, hi_], [lo_, hi_], "k--")
+axes[2].set_xlabel("T2M(t)"); axes[2].set_ylabel(f"T2M(t+{H}h)")
+axes[2].set_title(f"{H}-hour persistence, r = {hourly['T'].corr(hourly['T'].shift(-H)):.3f}")
+finish("09_temporal_dependence")
+
+# 3.9 wind ----------------------------------------------------------------------------------------------
+fig = plt.figure(figsize=(14, 5.5))
+ax = fig.add_subplot(1, 2, 1, projection="polar")
+ax.set_theta_zero_location("N"); ax.set_theta_direction(-1)
+nsec = 16; edges = np.linspace(0, 360, nsec + 1)
+sp_bins = [0, 2, 4, 6, 20]; cols = plt.cm.viridis(np.linspace(.15, .95, 4)); bottom = np.zeros(nsec)
+wind = raw[["WS10M", "WD10M"]].dropna()
+sector = (((wind["WD10M"] + 360 / nsec / 2) % 360) // (360 / nsec)).astype(int).clip(0, nsec - 1)
+for i in range(4):
+    msk = (wind["WS10M"] >= sp_bins[i]) & (wind["WS10M"] < sp_bins[i + 1])
+    cnt = np.bincount(sector[msk].values, minlength=nsec) / len(wind) * 100
+    ax.bar(np.deg2rad(edges[:-1]), cnt, width=np.deg2rad(360 / nsec), bottom=bottom, color=cols[i],
+           label=f"{sp_bins[i]}–{sp_bins[i+1] if i < 3 else '+'} m/s", edgecolor="white", lw=.3)
+    bottom += cnt
+ax.set_title("Wind rose (10 m, hourly) — % of time"); ax.legend(loc="lower left", bbox_to_anchor=(1.05, .1))
+ax2 = fig.add_subplot(1, 2, 2)
+sns.boxplot(x=hourly.index.hour, y=hourly.WS10, ax=ax2, palette="crest", fliersize=1)
+ax2.set_xlabel("Hour of day"); ax2.set_ylabel("Wind 10 m (m/s)"); ax2.set_title("Wind speed diurnal cycle")
+finish("10_wind")
+
+# %% 5. Models 
+class SubsampledSVR(BaseEstimator, RegressorMixin):
+    """Scaled SVR trained on an evenly spaced subsample (keeps kernel SVR tractable on ~50k hourly rows)."""
+    def __init__(self, C=3.0, epsilon=0.1, max_samples=SVR_MAX_N):
+        self.C, self.epsilon, self.max_samples = C, epsilon, max_samples
+    def fit(self, X, y):
+        X, y = np.asarray(X), np.asarray(y)
+        sel = np.linspace(0, len(X) - 1, min(len(X), self.max_samples)).astype(int)
+        self.model_ = TransformedTargetRegressor(
+            regressor=make_pipeline(StandardScaler(), SVR(C=self.C, epsilon=self.epsilon, gamma="scale")),
+            transformer=StandardScaler()).fit(X[sel], y[sel])
+        return self
+    def predict(self, X):
+        return self.model_.predict(np.asarray(X))
+
+def make_experts():
+    """Base experts used by every ensemble (identical for fair comparison)."""
+    return {
+        "Random Forest": RandomForestRegressor(n_estimators=200, min_samples_leaf=3, max_features=0.4,
+                                               n_jobs=N_JOBS, random_state=SEED),
+        "SVR": SubsampledSVR(C=3.0, epsilon=0.1),
+        "XGBoost": XGBRegressor(n_estimators=400, learning_rate=0.05, max_depth=5, subsample=0.8,
+                                colsample_bytree=0.7, reg_lambda=1.0, n_jobs=N_JOBS,
+                                random_state=SEED, verbosity=0),
+        "LightGBM": LGBMRegressor(n_estimators=500, learning_rate=0.05, num_leaves=31, subsample=0.8,
+                                  subsample_freq=1, colsample_bytree=0.7, min_child_samples=30,
+                                  importance_type="gain", n_jobs=N_JOBS, random_state=SEED, verbose=-1),
+        "CatBoost": CatBoostRegressor(iterations=600, learning_rate=0.08, depth=6, random_seed=SEED,
+                                      verbose=0, thread_count=N_JOBS),
+    }
+
+# Six reported comparison models: RF, XGBoost, LightGBM, CatBoost,
+# Weighted Voting, Ridge Stacking. SVR stays as the fifth INTERNAL expert.
+COMPARATORS = ["Random Forest", "XGBoost", "LightGBM", "CatBoost",
+               "Weighted Voting", "Ridge Stacking"]
+MAIN_MODELS = COMPARATORS + ["WCAS (proposed)"]
+GROUP = {"Persistence": "Reference", "Random Forest": "Bagging",
+         "XGBoost": "Boosting", "LightGBM": "Boosting", "CatBoost": "Boosting",
+         "Weighted Voting": "Voting", "Ridge Stacking": "Stacking",
+         "WCAS (proposed)": "Proposed"}
+GROUP_COL = {"Bagging": "#33a02c", "Boosting": "#ff7f00", "Voting": "#6a3d9a",
+             "Stacking": "#a65628", "Proposed": "#e31a1c", "Ablation": "#fb9a99"}
+
+def make_err_model():
+    """Small LightGBM that predicts expert expected |error| from weather features."""
+    return LGBMRegressor(n_estimators=150, learning_rate=0.05, num_leaves=7, min_child_samples=30,
+                         subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+                         n_jobs=N_JOBS, random_state=SEED, verbose=-1)
+
+def weights_from_E(E, p, eps=1e-3):
+    W = np.power(np.maximum(E, eps), -p)
+    return W / W.sum(1, keepdims=True)
+
+def simplex_weights(P, y):
+    K = P.shape[1]
+    res = minimize(lambda w: np.mean((P @ w - y) ** 2), np.ones(K) / K, method="SLSQP",
+                   bounds=[(0, 1)] * K, constraints={"type": "eq", "fun": lambda w: w.sum() - 1})
+    if not res.success:
+        raise RuntimeError(f"Voting-weight optimization failed: {res.message}")
+    return res.x
+
+def tune_p(Z_o, P_o, y_o, AE_o, conditional, gap):
+    """Choose weight sharpness p using a SECOND chronological CV over the OOF rows (no leakage)."""
+    folds2 = list(TimeSeriesSplit(n_splits=4, gap=gap).split(P_o))
+    E_cv = np.full(AE_o.shape, np.nan)
+    for tr, va in folds2:
+        if conditional:
+            for j in range(AE_o.shape[1]):
+                E_cv[va, j] = make_err_model().fit(Z_o.iloc[tr], AE_o[tr, j]).predict(Z_o.iloc[va])
+        else:
+            E_cv[va] = AE_o[tr].mean(0)
+    m = ~np.isnan(E_cv[:, 0])
+    scores = {p: np.sqrt(np.mean((y_o[m] - (weights_from_E(E_cv[m], p) * P_o[m]).sum(1)) ** 2)) for p in P_GRID}
+    return min(scores, key=scores.get)
+
+def run_adaptive(cols, conditional, Z_o, Z_te, P_o, y_o, AE_o, P_te, gap):
+    p = tune_p(Z_o[cols] if conditional else Z_o, P_o, y_o, AE_o, conditional, gap)
+    if conditional:
+        E_te = np.column_stack([make_err_model().fit(Z_o[cols], AE_o[:, j]).predict(Z_te[cols])
+                                for j in range(AE_o.shape[1])])
+    else:
+        E_te = np.tile(AE_o.mean(0), (len(P_te), 1))
+    W = weights_from_E(E_te, p)
+    return (W * P_te).sum(1), W, E_te, p
+
+def block_boot_delta(e_base, e_new, block=168, B=1000, seed=SEED, chunk=250):
+    """95 % CI of RMSE(base) - RMSE(new) using a moving-block bootstrap (positive = new is better).
+    Block = 168 h (one week) because hourly errors are strongly autocorrelated."""
+    rng = np.random.default_rng(seed); n = len(e_base); nb = int(np.ceil(n / block)); out = []
+    for _ in range(B // chunk):
+        starts = rng.integers(0, n - block + 1, size=(chunk, nb))
+        ii = (starts[:, :, None] + np.arange(block)).reshape(chunk, -1)[:, :n]
+        out.append(np.sqrt((e_base[ii] ** 2).mean(1)) - np.sqrt((e_new[ii] ** 2).mean(1)))
+    return np.percentile(np.concatenate(out), [2.5, 97.5])
+
+# %% 6. Experiments (single horizon: t -> t+H hours) 
+MET_Z  = ["T", "RH", "QV", "PS", "WS10", "PRECIP", "SW", "CLOUD",
+          "T_diff3", "T_rs24", "T_rm24", "PS_diff3"]
+SEAS_Z = ["HR_SIN", "HR_COS", "DOY_SIN", "DOY_COS", "T_HR_SIN", "T_HR_COS"]
+Z_FULL = MET_Z + SEAS_Z
+VARIANTS = {   # ablation: which part of WCAS is removed
+    "WCAS (proposed)":              dict(cols=Z_FULL, conditional=True),
+    "Abl: no meteorological terms":         dict(cols=SEAS_Z, conditional=True),
+    "Abl: no seasonal terms":       dict(cols=[c for c in Z_FULL if c not in SEAS_Z], conditional=True),
+    "Abl: static weights":          dict(cols=None, conditional=False),
+}
+
+results, preds = [], {}
+t0 = time.time()
+print(f"\n{'='*30}  HORIZON +{H} hour(s)  {'='*30}")
+
+# ---------- supervised table -----------
+X_all = F.loc[idx].copy()
+y_all = hourly["T"].shift(-H).loc[idx]
+tgt_time = idx + pd.Timedelta(hours=H)                            # target time is known in advance
+X_all["T_HR_SIN"] = np.sin(2 * np.pi * tgt_time.hour.values / 24)
+X_all["T_HR_COS"] = np.cos(2 * np.pi * tgt_time.hour.values / 24)
+tr_n = split - H                                                  # purge last H rows (targets fall in test)
+X_tr, y_tr = X_all.iloc[:tr_n], y_all.iloc[:tr_n]
+X_te, y_te = X_all.iloc[split:], y_all.iloc[split:]
+Z_all = X_all.copy()
+Z_tr_full, Z_te = Z_all.iloc[:tr_n], Z_all.iloc[split:]
+yt = y_te.values
+
+hot_thr, cool_thr = y_tr.quantile(HOT_Q), y_tr.quantile(COOL_Q)
+masks = {"Hot": yt >= hot_thr, "Cool": yt <= cool_thr}
+masks["Moderate"] = ~(masks["Hot"] | masks["Cool"])
+print(f"train {len(X_tr):,} | test {len(X_te):,} | test hours: " + ", ".join(f"{k}={v.sum()}" for k, v in masks.items()))
+
+def record(name, p, group=None):
+    p = np.asarray(p, dtype=float); preds[name] = p
+    r = dict(Model=name, Group=group or GROUP.get(name, "Ablation"),
+             MAE=mean_absolute_error(yt, p), RMSE=np.sqrt(mean_squared_error(yt, p)),
+             R2=r2_score(yt, p), Bias=np.mean(p - yt))
+    for k, m in masks.items():
+        r[f"{k}_RMSE"] = np.sqrt(np.mean((p[m] - yt[m]) ** 2)) if m.any() else np.nan
+    results.append(r)
+
+# ---------- persistence reference (diagnostic only, not among 6 comparators) -----------
+record("Persistence", X_te["T"].values)
+
+# ---------- individual ML models -----------
+experts = make_experts()
+P_te = np.zeros((len(X_te), len(experts)))
+fitted = {}
+for j, (name, mdl) in enumerate(experts.items()):
+    fitted[name] = clone(mdl).fit(X_tr, y_tr)
+    P_te[:, j] = fitted[name].predict(X_te)
+    if name in COMPARATORS:  # SVR is used inside all ensembles, but not reported separately
+        record(name, P_te[:, j])
+    print(f"  {name:<18s} done  ({time.time()-t0:.0f}s)")
+names = list(experts.keys()); K = len(names)
+
+# ---------- chronological OOF predictions (expanding window with gap) -----------
+folds = list(TimeSeriesSplit(n_splits=N_SPLITS, gap=H, test_size=len(X_tr) // 8).split(X_tr))
+oof = np.full((len(X_tr), K), np.nan)
+for tr, va in folds:
+    for j, (name, mdl) in enumerate(experts.items()):
+        oof[va, j] = clone(mdl).fit(X_tr.iloc[tr], y_tr.iloc[tr]).predict(X_tr.iloc[va])
+    print(f"  OOF fold done ({time.time()-t0:.0f}s)")
+om = ~np.isnan(oof[:, 0])
+P_o, y_o = oof[om], y_tr.values[om]
+Z_o = Z_tr_full.iloc[np.where(om)[0]].reset_index(drop=True)
+AE_o = np.abs(y_o[:, None] - P_o)
+print("OOF RMSE per expert:", {n: round(float(np.sqrt(np.mean((y_o - P_o[:, j]) ** 2))), 3) for j, n in enumerate(names)})
+
+# ---------- conventional ensembles -----------
+w_opt = simplex_weights(P_o, y_o)
+record("Weighted Voting", P_te @ w_opt)
+ridge = Ridge(alpha=1.0, positive=True).fit(P_o, y_o)
+record("Ridge Stacking", ridge.predict(P_te))
+# ---------- proposed WCAS + ablations -----------
+info = {}
+for vname, cfg in VARIANTS.items():
+    p_hat, W, E_te, p_star = run_adaptive(cfg["cols"], cfg["conditional"], Z_o, Z_te, P_o, y_o, AE_o, P_te, H)
+    record(vname, p_hat, group="Proposed" if vname == "WCAS (proposed)" else "Ablation")
+    info[vname] = dict(W=W, E=E_te, p=p_star)
+Wf, Ef = info["WCAS (proposed)"]["W"], info["WCAS (proposed)"]["E"]
+hard = np.eye(K)[Ef.argmin(1)]
+record("Abl: hard selection", (hard * P_te).sum(1), group="Ablation")
+print(f"WCAS sharpness p* = {info['WCAS (proposed)']['p']} | static p* = {info['Abl: static weights']['p']}")
+
+skill = {n: stats.spearmanr(Ef[:, j], np.abs(yt - P_te[:, j]))[0] for j, n in enumerate(names)}
+print("Error-model Spearman skill:", {k: round(v, 2) for k, v in skill.items()})
+print(f"total elapsed {time.time()-t0:.0f}s")
+
+res = pd.DataFrame(results)
+res.to_csv(os.path.join(OUT_DIR, "all_results.csv"), index=False)
+
+# %% 7. Result tables: MAE, RMSE, R2 for EVERY model 
+pd.set_option("display.width", 200)
+main = res[res.Model.isin(MAIN_MODELS)].sort_values("RMSE").reset_index(drop=True)
+print(f"\n===== Test performance, hourly forecast t+{H}h — MAE, RMSE, R2 for every model (sorted by RMSE) =====")
+print(main[["Model", "Group", "MAE", "RMSE", "R2"]].round(4).to_string(index=False))
+
+print("\n===== Extra diagnostics (bias and RMSE by temperature condition) =====")
+print(main[["Model", "Bias", "Hot_RMSE", "Moderate_RMSE", "Cool_RMSE"]].round(3).to_string(index=False))
+
+print("\n===== Ablation variants =====")
+print(res[res.Group == "Ablation"].sort_values("RMSE")[["Model", "MAE", "RMSE", "R2", "Hot_RMSE"]].round(4).to_string(index=False))
+
+main[["Model", "Group", "MAE", "RMSE", "R2"]].to_csv(os.path.join(OUT_DIR, "metrics_mae_rmse_r2.csv"), index=False)
+
+# Exploratory comparison: the strongest baseline is selected using test data.
+print("\n===== Significance: WCAS vs strongest non-proposed model =====")
+r = res[res.Model.isin(COMPARATORS)].sort_values("RMSE")
+best = r.iloc[0]["Model"]
+e_b = preds[best] - yt
+e_w = preds["WCAS (proposed)"] - yt
+lo, hi = block_boot_delta(e_b, e_w)
+sig = pd.DataFrame([dict(Strongest_baseline=best,
+                         RMSE_base=np.sqrt(np.mean(e_b**2)), RMSE_WCAS=np.sqrt(np.mean(e_w**2)),
+                         RMSE_gain_pct=100 * (1 - np.sqrt(np.mean(e_w**2)) / np.sqrt(np.mean(e_b**2))),
+                         Boot95_lo=lo, Boot95_hi=hi,
+                         Wilcoxon_p=stats.wilcoxon(np.abs(e_b), np.abs(e_w)).pvalue)])
+print(sig.round(4).to_string(index=False))
+sig.to_csv(os.path.join(OUT_DIR, "significance.csv"), index=False)
+print("(Exploratory post-selection interval; not a confirmatory significance claim. Boot95 = 95% CI of RMSE_base - RMSE_WCAS. Hourly residuals are strongly "
+      "autocorrelated, so rely mainly on the 1-week block bootstrap.)")
+
+# %% 8. Result visualisations 
+# 8.1 MAE / RMSE / R2 bar charts for every model -------------------------------------------------------
+order_m = main.sort_values("RMSE", ascending=False)
+fig, axes = plt.subplots(1, 3, figsize=(20, 8))
+for a, met in zip(axes, ["MAE", "RMSE", "R2"]):
+    t = order_m.copy()
+    a.barh(t.Model, t[met], color=[GROUP_COL[g] for g in t.Group])
+    lo_v, hi_v = t[met].min(), t[met].max()
+    if met == "R2":
+        a.set_xlim(max(0, lo_v - 0.05) if lo_v > 0.3 else lo_v - .05, 1.0)
+    for i, v in enumerate(t[met]):
+        a.text(v, i, f" {v:.3f}", va="center", fontsize=11)
+    a.set_title(f"Test {met}" + (" (°C)" if met != "R2" else "") + f" — t+{H}h"); a.set_xlabel(met)
+handles = [plt.Rectangle((0, 0), 1, 1, color=c) for g_, c in GROUP_COL.items() if g_ != "Ablation"]
+fig.legend(handles, [g_ for g_ in GROUP_COL if g_ != "Ablation"], ncol=7, loc="lower center", bbox_to_anchor=(.5, -.03))
+finish("20_model_comparison_mae_rmse_r2")
+
+# 8.2 heat-table ---------------------------------------------------------------------------------------
+tbl = main.set_index("Model")[["MAE", "RMSE", "R2"]]
+fig, axes = plt.subplots(1, 3, figsize=(12, 8))
+for a, met, cm in zip(axes, ["MAE", "RMSE", "R2"], ["YlOrRd", "YlOrRd", "YlGnBu"]):
+    sns.heatmap(tbl[[met]], annot=True, fmt=".4f", cmap=cm, ax=a, cbar=False)
+    a.set_title(met); a.set_ylabel("" if met != "MAE" else "Model")
+    if met != "MAE": a.set_yticklabels([])
+fig.suptitle("Metrics table (rows ordered by RMSE)", fontweight="bold")
+finish("21_metrics_table")
+
+# 8.3 forecasts vs actual ------------------------------------------------------------------------------
+best_stack = res[res.Group.isin(["Stacking", "Voting"])].sort_values("RMSE").iloc[0].Model
+dts = y_te.index + pd.Timedelta(hours=H)
+mid = len(dts) // 2; win = slice(mid, mid + 24 * 14)                          # a 14-day window
+fig, axes = plt.subplots(2, 1, figsize=(14, 7))
+for a, sl, ttl in zip(axes, [slice(None), win], ["Full test period", "Zoom: 14 days"]):
+    a.plot(dts[sl], yt[sl], color="k", lw=1.0, label="Observed T2M")
+    a.plot(dts[sl], preds[best_stack][sl], color="#a65628", lw=.9, alpha=.8, label=best_stack)
+    a.plot(dts[sl], preds["WCAS (proposed)"][sl], color="#e31a1c", lw=.9, label="WCAS (proposed)")
+    a.set_ylabel("°C"); a.set_title(f"{ttl} — t+{H}h forecast"); a.legend(ncol=3, fontsize=11, loc="lower right")
+finish("22_forecast_vs_observed")
+
+# 8.4 hot / moderate / cool robustness ---------------------------------------------------------------------
+sub = res.set_index("Model")
+best_single = sub[sub.Group.isin(["Boosting", "Bagging", "Traditional ML"])].RMSE.idxmin()
+show = ["Persistence", best_single, "Weighted Voting", "Ridge Stacking", "WCAS (proposed)"]
+d = sub.loc[show, ["Hot_RMSE", "Moderate_RMSE", "Cool_RMSE"]]; d.columns = ["Hot", "Moderate", "Cool"]
+fig, ax = plt.subplots(figsize=(9, 5))
+d.T.plot(kind="bar", ax=ax, width=.85, colormap="tab20", rot=0)
+ax.set_title(f"RMSE by temperature regime (t+{H}h)"); ax.set_ylabel("RMSE (°C)"); ax.legend(fontsize=11)
+finish("23_extreme_robustness")
+
+# 8.5 ablation -----------------------------------------------------------------------------------------------
+abl_order = ["Weighted Voting", "Ridge Stacking", "Abl: static weights", "Abl: hard selection",
+             "Abl: no seasonal terms", "Abl: no meteorological terms", "WCAS (proposed)"]
+ab = res.set_index("Model").loc[abl_order]
+fig, axes = plt.subplots(1, 3, figsize=(18, 4.8))
+for a, met in zip(axes, ["MAE", "RMSE", "Hot_RMSE"]):
+    a.barh(ab.index, ab[met], color=["#6a3d9a", "#a65628", "#fb9a99", "#fb9a99", "#fb9a99", "#fb9a99", "#e31a1c"])
+    a.set_xlim(ab[met].min() * 0.95, ab[met].max() * 1.02)
+    for i, v in enumerate(ab[met]): a.text(v, i, f" {v:.3f}", va="center", fontsize=11)
+    a.set_title(f"Ablation — {met.replace('_', ' ')}"); a.set_xlabel("°C")
+finish("24_ablation")
+
+# 8.6 adaptive weights ------------------------------------------------------------------------------------------
+Wdf = pd.DataFrame(Wf, index=y_te.index, columns=names).rolling(24, min_periods=1).mean()
+fig, axes = plt.subplots(1, 2, figsize=(17, 5), gridspec_kw={"width_ratios": [2, 1]})
+axes[0].stackplot(Wdf.index, Wdf.T.values, labels=names, colors=sns.color_palette("Set2", len(names)))
+ax2 = axes[0].twinx(); ax2.plot(Wdf.index, hourly.loc[Wdf.index, "T"].rolling(24, min_periods=1).mean(), color="k", lw=.8)
+ax2.set_ylabel("T2M, 24-h mean (°C)"); ax2.grid(False); axes[0].set_ylim(0, 1); axes[0].set_ylabel("Adaptive weight")
+axes[0].legend(ncol=5, fontsize=11, loc="upper center", bbox_to_anchor=(.5, 1.18))
+axes[0].set_title(f"WCAS expert weights over the test period (t+{H}h, 24-h smoothed)", pad=30)
+# Compare mean expert weights across temperature conditions without clustering.
+# Use CURRENT temperature (known at prediction time) and TRAIN-derived thresholds.
+conditions = np.where(Z_te["T"].values >= hot_thr, "Hot",
+                      np.where(Z_te["T"].values <= cool_thr, "Cool", "Moderate"))
+mw = pd.DataFrame(Wf, columns=names).groupby(conditions).mean().reindex(["Cool", "Moderate", "Hot"])
+sns.heatmap(mw, annot=True, fmt=".2f", cmap="Reds", ax=axes[1], cbar_kws={"label": "mean weight"})
+axes[1].set_ylabel("Current temperature condition"); axes[1].set_title("Mean weight by current temperature condition")
+finish("25_adaptive_weights")
+
+# 8.7 error-model skill ---------------------------------------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(7, 4))
+pd.Series(skill).plot(kind="bar", ax=ax, color="#2a9d8f", rot=0); ax.axhline(0, color="k", lw=.8)
+ax.set_ylabel("Spearman ρ"); ax.set_title("Can weather features predict each expert's error? (test set)")
+finish("26_error_model_skill")
+
+# 8.8 diagnostics of the proposed model -----------------------------------------------------------------------------------
+resid = preds["WCAS (proposed)"] - yt
+fig, axes = plt.subplots(1, 3, figsize=(17, 4.8))
+ss = np.random.default_rng(SEED).choice(len(yt), size=min(6000, len(yt)), replace=False)
+axes[0].scatter(yt[ss], preds["WCAS (proposed)"][ss], s=5, alpha=.4, color="#e31a1c")
+lo_, hi_ = hourly["T"].min(), hourly["T"].max(); axes[0].plot([lo_, hi_], [lo_, hi_], "k--")
+axes[0].set_xlabel("Observed T2M"); axes[0].set_ylabel("WCAS prediction"); axes[0].set_title("Predicted vs observed")
+sns.kdeplot(resid, ax=axes[1], color="#e31a1c", fill=True, alpha=.3)
+axes[1].axvline(0, color="k", lw=.8); axes[1].set_xlabel("Residual (°C)"); axes[1].set_title(f"Residual distribution (σ = {resid.std():.2f})")
+axes[2].scatter(yt[ss], resid[ss], s=5, alpha=.4, color="#e31a1c"); axes[2].axhline(0, color="k", lw=.8)
+axes[2].set_xlabel("Observed T2M"); axes[2].set_ylabel("Residual"); axes[2].set_title("Residual vs level: check heat under-prediction")
+finish("27_wcas_diagnostics")
+
+# 8.9 feature importance (LightGBM expert) -----------------------------------------------------------------------------------
+imp = pd.Series(fitted["LightGBM"].feature_importances_, index=list(X_tr.columns))
+imp = (imp / imp.sum()).sort_values().tail(5)
+fig, ax = plt.subplots(figsize=(7, 7))
+ax.barh(imp.index, imp.values, color="#ff7f00"); ax.set_xlabel("Normalised gain")
+ax.set_title(f"Top-5 features — LightGBM expert (t+{H}h)")
+finish("28_feature_importance")
+
+# %% 9. Summary 
+print(f"\n===== HEADLINE (hourly, t+{H}h) =====")
+head = res[res.Model.isin(MAIN_MODELS)]
+print(head.set_index("Model")[["MAE", "RMSE", "R2"]].round(4).to_string())
+print(f"\nSaved: tables -> {OUT_DIR}/(all_results|metrics_mae_rmse_r2|significance).csv ; figures -> {FIG_DIR}")
